@@ -10,6 +10,13 @@
 #include "NTThelper.cuh"
 
 #define NTC_LD(p) __ldcs(p)
+// Thread-block clusters (and the PTX they emit) exist only on sm_90+. Below that the cluster kernels are
+// compiled without the attribute and their bodies trap; their launches are disabled at runtime there.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+#define NTC_CLUSTER_DIMS(x)
+#else
+#define NTC_CLUSTER_DIMS(x) __cluster_dims__(x, 1, 1)
+#endif
 
 namespace FIDESlib {
 namespace ntc {

@@ -81,10 +81,13 @@ __global__ void coeffRowsMac_(CtTables t, int n, const uint32_t* __restrict__ sc
 // memory and accumulates the products in registers. Row groups write partial sums (coeffRowsReduce_).
 namespace cg = cooperative_groups;
 
-__global__ void __cluster_dims__(ntc::CL, 1, 1) __launch_bounds__(ntc::GROUPS* ntc::BD, 2)
+__global__ void NTC_CLUSTER_DIMS(ntc::CL) __launch_bounds__(ntc::GROUPS* ntc::BD, 2)
     coeffRowsFused_(const Global::Globals* Globals, const float* __restrict__ rows, size_t rowStride, int n, int groups,
                     double scale, int L, CtTables t, void** out0, void** out1, uint32_t* partial, bool accumulate,
                     unsigned long long* overflow) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+    __trap();  // thread-block clusters need sm_90+; this path is opt-in (FIDESLIB_COEFF_FUSED)
+#else
     using namespace ntc;
     __shared__ __align__(16) T region[REG_I2 * 2];
     __shared__ T psi[BD], psi_sh[BD];
@@ -197,6 +200,7 @@ __global__ void __cluster_dims__(ntc::CL, 1, 1) __launch_bounds__(ntc::GROUPS* n
             p1[q] = make_uint2(a1[2 * i], a1[2 * i + 1]);
         }
     }
+#endif
 }
 
 __global__ void coeffRowsReduce_(const uint32_t* __restrict__ partial, int groups, int L, int N, void** out0, void** out1,
@@ -218,7 +222,12 @@ __global__ void coeffRowsReduce_(const uint32_t* __restrict__ partial, int group
 bool fusedOn() {
     static const bool v = [] {
         const char* e = std::getenv("FIDESLIB_COEFF_FUSED");
-        return !(e && e[0] == '0');
+        if (e) return e[0] != '0';
+        // default on only where thread-block clusters exist (sm_90+); the fused kernel traps below that
+        int dev = 0, major = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        return major >= 9;
     }();
     return v;
 }

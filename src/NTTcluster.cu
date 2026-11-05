@@ -28,9 +28,12 @@ void setNttCluster(int v) {
 namespace ntc {
 // ---------------------------------------------------------------------------------------------------
 template <bool INVERSE>
-__global__ void __cluster_dims__(CL, 1, 1) __launch_bounds__(GROUPS* BD, 2)
+__global__ void NTC_CLUSTER_DIMS(CL) __launch_bounds__(GROUPS* BD, 2)
     ntt_cluster_(const Global::Globals* Globals, void** __restrict__ dat, const int __grid_constant__ primeid_init,
                  void** __restrict__ res, const int __grid_constant__ period) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+    __trap();  // thread-block clusters need sm_90+; this path is opt-in (FIDESLIB_NTT_CLUSTER)
+#else
     __shared__ __align__(16) T region[REG_I2 * 2];  // 4 tiles x 2048 u32 = 32 KB: pass-1 output / working tiles
     __shared__ T psi[BD], psi_sh[BD];
 
@@ -166,6 +169,7 @@ __global__ void __cluster_dims__(CL, 1, 1) __launch_bounds__(GROUPS* BD, 2)
     } else {
         cluster.sync();  // a hole is a whole limb, so the whole cluster takes this branch: 2 syncs either way
     }
+#endif
 }
 #undef GA
 #undef GAS
