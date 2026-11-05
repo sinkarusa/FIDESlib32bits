@@ -13,6 +13,7 @@
 #include "ConstantsGPU.cuh"
 #include "LimbUtils.cuh"
 #include "ModMult.cuh"
+#include "NTT.cuh"
 #include "NTTcluster.cuh"
 #include "NTTcore.cuh"
 
@@ -219,15 +220,23 @@ __global__ void coeffRowsReduce_(const uint32_t* __restrict__ partial, int group
     ((uint32_t*)out1[l])[k] = modreduce_lazy(s1, primeid);
 }
 
+// thread-block clusters (the fused kernel, the single-pass cluster NTT) exist on sm_90+ only
+bool clustersOn() {
+    static const bool v = [] {
+        int dev = 0, major = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        return major >= 9;
+    }();
+    return v;
+}
+
 bool fusedOn() {
     static const bool v = [] {
         const char* e = std::getenv("FIDESLIB_COEFF_FUSED");
         if (e) return e[0] != '0';
         // default on only where thread-block clusters exist (sm_90+); the fused kernel traps below that
-        int dev = 0, major = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-        return major >= 9;
+        return clustersOn();
     }();
     return v;
 }
@@ -242,6 +251,8 @@ bool fusedOn() {
 struct Set {
     float* stage = nullptr;                   // chunk x N rows (device copy of pinned host rows)
     uint32_t* res = nullptr;                  // chunk x L x N residues (room for Lcap limbs)
+    uint32_t* aux = nullptr;                  // L x N: the two-pass NTT's intermediate (no clusters: < sm_90)
+    void** auxptrs = nullptr;                 // aux's limb pointers
     std::map<int, void**> ptrs;               // per limb count: res's limb pointers, for the NTT
     cudaEvent_t copied = nullptr, scattered = nullptr, encoded = nullptr, macked = nullptr;
 };
@@ -286,11 +297,22 @@ void ensure(Scratch& s, int N, int L, int chunk) {
     for (auto& b : s.set) {
         if (b.stage) cudaFree(b.stage);
         if (b.res) cudaFree(b.res);
+        if (b.aux) cudaFree(b.aux);
+        if (b.auxptrs) cudaFree(b.auxptrs);
+        b.aux = nullptr;
+        b.auxptrs = nullptr;
         for (auto& [l, p] : b.ptrs) cudaFree(p);
         b.ptrs.clear();
         cudaMalloc(&b.stage, sizeof(float) * (size_t)chunk * N);
         if (!fusedOn())
             cudaMalloc(&b.res, sizeof(uint32_t) * (size_t)chunk * L * N);
+        if (!fusedOn() && !clustersOn()) {
+            cudaMalloc(&b.aux, sizeof(uint32_t) * (size_t)L * N);
+            std::vector<void*> h(L);
+            for (int i = 0; i < L; ++i) h[i] = b.aux + (size_t)i * N;
+            cudaMalloc(&b.auxptrs, sizeof(void*) * L);
+            cudaMemcpy(b.auxptrs, h.data(), sizeof(void*) * L, cudaMemcpyHostToDevice);
+        }
     }
     s.N = N;
     s.Lcap = L;
@@ -435,7 +457,22 @@ void multCoeffRowsSum(Ciphertext& out, const std::vector<const Ciphertext*>& cts
         coeffRowsScatter_<<<dim3((N + 255) / 256, n), 256, 0, s.enc>>>(src, stride, scale, N, L, b.res,
                                                                        const_cast<unsigned long long*>(ovf));
         cudaEventRecord(b.scattered, s.enc);
-        launchNTTcluster(G, false, ptrs, 0, ptrs, n * L, s.enc, L);
+        if (clustersOn()) {
+            launchNTTcluster(G, false, ptrs, 0, ptrs, n * L, s.enc, L);
+        } else {
+            // below sm_90 the cluster NTT traps (a sticky launch failure that surfaces as the next allocation's
+            // "out of memory"): the two-pass transform of LimbPartition::ApplyNTT (NTT_NONE, ALGO_SHOUP, u32 limbs)
+            // per plaintext row, limbs 0..L-1 with primes primeid_flattened[l], through the set's aux limbs
+            const int M = FIDES_NTT_M32;
+            const dim3 b1{(uint32_t)(1 << ((C.logN + 1) / 2 - 1))}, b2{(uint32_t)(1 << (C.logN / 2 - 1))};
+            const int by1 = 4 * b1.x * (2 * M + 2), by2 = 4 * b2.x * (2 * M + 2);
+            for (int r = 0; r < n; ++r) {
+                nttLaunch(NTT_<false, ALGO_SHOUP, NTT_NONE>, dim3{(uint32_t)(N / (b1.x * M * 2)), (uint32_t)L}, b1, by1,
+                          s.enc, G, ptrs + (size_t)r * L, 0, b.auxptrs, nullptr, 0, nullptr, nullptr);
+                nttLaunch(NTT_<true, ALGO_SHOUP, NTT_NONE>, dim3{(uint32_t)(N / (b2.x * M * 2)), (uint32_t)L}, b2, by2,
+                          s.enc, G, b.auxptrs, 0, ptrs + (size_t)r * L, nullptr, 0, nullptr, nullptr);
+            }
+        }
         cudaEventRecord(b.encoded, s.enc);
         CtTables t{};
         for (int r = 0; r < n; ++r) {
