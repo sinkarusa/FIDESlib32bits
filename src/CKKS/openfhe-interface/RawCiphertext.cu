@@ -3,6 +3,7 @@
 //
 #include <algorithm>
 #include <bit>
+#include <atomic>
 #include <cmath>
 #include <complex>
 #include <cassert>
@@ -523,8 +524,21 @@ static std::vector<std::vector<std::vector<uint64_t>>> rawDigits(const std::vect
     return out;
 }
 
+namespace {
+std::atomic<bool> g_host_keys_freed{false};
+}
+void FIDESlib::CKKS::MarkHostKeysFreed() { g_host_keys_freed.store(true); }
+bool FIDESlib::CKKS::HostKeysFreed() { return g_host_keys_freed.load(); }
+void FIDESlib::CKKS::RequireHostKeys(const char* who) {
+    if (g_host_keys_freed.load())
+        throw std::runtime_error(std::string(who) +
+                                 ": OpenFHE's host eval keys were freed (PF_FREE_HOST_KEYS / free_host_keys); this path "
+                                 "re-reads them, so it must run before the free");
+}
+
 FIDESlib::CKKS::RawKeySwitchKey FIDESlib::CKKS::GetKeySwitchKey(
     std::shared_ptr<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>> ek) {
+    RequireHostKeys("GetKeySwitchKey");
     std::vector<std::vector<std::vector<uint64_t>>> moduli;
     for (const auto* v : {&ek->GetAVector(), &ek->GetBVector()}) {
         moduli.emplace_back();
@@ -554,6 +568,7 @@ FIDESlib::CKKS::RawKeySwitchKey FIDESlib::CKKS::GetKeySwitchKey(
 
 FIDESlib::CKKS::RawKeySwitchKey FIDESlib::CKKS::GetEvalKeySwitchKey(const lbcrypto::KeyPair<lbcrypto::DCRTPoly>& keys) {
 
+    RequireHostKeys("GetEvalKeySwitchKey");
     //const auto cryptoParams = std::dynamic_pointer_cast<CryptoParametersCKKSRNS>(cc->GetCryptoParameters());
 
     auto& keyMap = keys.publicKey->GetCryptoContext()->GetAllEvalMultKeys();
@@ -571,6 +586,7 @@ FIDESlib::CKKS::RawKeySwitchKey FIDESlib::CKKS::GetEvalKeySwitchKey(const lbcryp
 
 FIDESlib::CKKS::RawKeySwitchKey FIDESlib::CKKS::GetEvalKeySwitchKey(
     const lbcrypto::PublicKey<lbcrypto::DCRTPoly>& publicKey) {
+    RequireHostKeys("GetEvalKeySwitchKey");
     lbcrypto::CryptoContext<lbcrypto::DCRTPoly> cc = publicKey->GetCryptoContext();
     auto& keyMap = cc->GetAllEvalMultKeys();
     //lbcrypto::CryptoContextImpl<DCRTPoly>::s_evalMultKeyMap;
@@ -588,6 +604,7 @@ FIDESlib::CKKS::RawKeySwitchKey FIDESlib::CKKS::GetEvalKeySwitchKey(
 
 FIDESlib::CKKS::RawKeySwitchKey FIDESlib::CKKS::GetRotationKeySwitchKey(
     const KeyPair<lbcrypto::DCRTPoly>& keys, int index, lbcrypto::CryptoContext<lbcrypto::DCRTPoly> cc) {
+    RequireHostKeys("GetRotationKeySwitchKey");
     auto& keyMap = cc->GetAllEvalAutomorphismKeys();
 
     if (keyMap.find(keys.secretKey->GetKeyTag()) != keyMap.end()) {
@@ -612,6 +629,7 @@ FIDESlib::CKKS::RawKeySwitchKey FIDESlib::CKKS::GetRotationKeySwitchKey(
 
 FIDESlib::CKKS::RawKeySwitchKey FIDESlib::CKKS::GetRotationKeySwitchKey(
     const lbcrypto::PublicKey<lbcrypto::DCRTPoly>& publicKey, int index) {
+    RequireHostKeys("GetRotationKeySwitchKey");
     lbcrypto::CryptoContext<lbcrypto::DCRTPoly> cc = publicKey->GetCryptoContext();
     auto& keyMap = cc->GetAllEvalAutomorphismKeys();
 
@@ -635,6 +653,7 @@ FIDESlib::CKKS::RawKeySwitchKey FIDESlib::CKKS::GetRotationKeySwitchKey(
 
 FIDESlib::CKKS::RawKeySwitchKey FIDESlib::CKKS::GetConjugateKeySwitchKey(
     const lbcrypto::PublicKey<lbcrypto::DCRTPoly>& publicKey) {
+    RequireHostKeys("GetConjugateKeySwitchKey");
     lbcrypto::CryptoContext<lbcrypto::DCRTPoly> cc = publicKey->GetCryptoContext();
     auto& keyMap2 = cc->GetEvalAutomorphismKeyMap(publicKey->GetKeyTag());
 
@@ -1175,6 +1194,7 @@ void FIDESlib::CKKS::GenBootstrapKeys(const lbcrypto::PrivateKey<lbcrypto::DCRTP
 
 void FIDESlib::CKKS::AddBootstrapKeys(const lbcrypto::PublicKey<lbcrypto::DCRTPoly>& publicKey, int slots,
                                       FIDESlib::CKKS::Context& GPUcc_) {
+    RequireHostKeys("AddBootstrapKeys");
     lbcrypto::CryptoContext<lbcrypto::DCRTPoly> cc = publicKey->GetCryptoContext();
     FIDESlib::CKKS::BootstrapPrecomputation& result = GPUcc_->GetBootPrecomputation(slots);
 

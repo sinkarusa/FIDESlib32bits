@@ -1962,6 +1962,30 @@ void btsStcFirstInput(Ciphertext& ctxt, const BtsState& st, bool ownCf) {
                                  std::to_string(ctxt.getLevel()));
 }
 
+// btsStcHigh's plaintext cache (file scope so btsStcCacheFree can drop it)
+static std::map<std::tuple<int, int, int, long long>, std::vector<BootstrapPrecomputation::LTstep>> g_stcHighCache;
+
+size_t btsStcCacheFree(Context& cc_, bool firstRef, bool high) {
+    cudaDeviceSynchronize();  // the cached plaintexts may still be read by kernels in flight
+    size_t n = 0;
+    auto drop = [&](std::map<std::pair<int, long long>, std::vector<BootstrapPrecomputation::LTstep>>& m) {
+        for (auto it = m.begin(); it != m.end();)
+            if (it->first.first >= kStcFirstCfRef) { it = m.erase(it); ++n; } else ++it;
+    };
+    if (firstRef)
+        for (auto& [slots, p] : cc_->precom.boot) {
+            drop(p.stc_first_last);
+            drop(p.stc_alt_last);
+            for (auto& [d, v] : p.raise_variants)
+                if (v) { drop(v->stc_first_last); drop(v->stc_alt_last); }
+        }
+    if (high) {
+        n += g_stcHighCache.size();
+        g_stcHighCache.clear();
+    }
+    return n;
+}
+
 void btsStcHigh(Ciphertext& ctxt, int slots, int outLimb, double factor, int skipMask, double nfRef) {
     CudaNvtxRange r(std::string{"bts::stc_high"});
     Context& cc_ = ctxt.cc_;
@@ -1988,7 +2012,7 @@ void btsStcHigh(Ciphertext& ctxt, int slots, int outLimb, double factor, int ski
     if (nfRef > 0)
         factor *= nfRef / ctxt.NoiseFactor;
     ctxt.slots = slots;
-    static std::map<std::tuple<int, int, int, long long>, std::vector<BootstrapPrecomputation::LTstep>> cache;
+    auto& cache = g_stcHighCache;
     // FIDESLIB_STC_HIGH_POW2=1: factors that differ by a power of two share one entry, built for the smallest exponent
     // seen (per slots / outLimb / skipMask and fractional part of log2 factor); a larger one first multiplies the
     // ciphertext by the exact integer 2^(e - e_entry) (the last stage's factor is linear in it). A smaller exponent

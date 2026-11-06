@@ -303,6 +303,29 @@ class ContextData {
     std::mutex elem_memo_mutex;
     std::unordered_map<ElemMemoKey, std::vector<uint64_t>, ElemMemoKeyHash> elem_memo;
 
+    /** L8 (FIDESLIB_ROT_KEYS_HOST=1): AddRotationKey host-backs (KeyHostImage) the keys whose normalized index is in
+     *  rotKeysHostSteps (LoadContext: the model steps no bootstrap route uses; empty = off). GetRotationKey fetches a
+     *  host-backed key into a device LRU cache of FIDESLIB_ROT_KEYS_DEV_GB (default 2) and evicts the least recently
+     *  used ones that are not in the open RotKeyScope. RemoveRotationKey drops the index (a reload stays resident).
+     *  Single host thread. Appended at the END of the class: the wrapper calls setRotKeysHostSteps only. */
+    void setRotKeysHostSteps(std::set<int> steps);
+    void rotKeysHostAdopt(KeySwitchingKey& k);   // AddRotationKey: host-back a just-stored key (KeyHostImage)
+    KeySwitchingKey& rotKeyUse(KeySwitchingKey& k);
+    /** Every key GetRotationKey returns while a scope is open stays resident until the outermost scope closes: the
+     *  hoisted paths gather several keys' tables before they launch. */
+    struct RotKeyScope {
+        ContextData& cc;
+        explicit RotKeyScope(ContextData& c);
+        ~RotKeyScope();
+        RotKeyScope(const RotKeyScope&) = delete;
+        RotKeyScope& operator=(const RotKeyScope&) = delete;
+    };
+    std::set<int> rotKeysHostSteps;
+    size_t rotKeysDevBudget = 0;
+    uint64_t rotKeysClock = 0;
+    uint64_t rotKeysScopeId = 0;
+    int rotKeysScopeDepth = 0;
+
 };
 
 Context GenCryptoContextGPU(const Parameters& param, const std::vector<int>& devs);

@@ -627,7 +627,33 @@ void CryptoContextImpl<DCRTPoly>::LoadContext(const PublicKey<DCRTPoly>& publicK
 			v += half_ring;
 		return v;
 	};
-	if (rot_band >= 0) {
+	// FIDESLIB_ROT_KEY_BANDS=<json> (lever N2b): per-key bands from a FIDESLIB_ROT_LIMB_LOG file {"index": max_limbs};
+	// a listed model key is banded to max_limbs - 1 (the chain position of its highest key switch), unlisted keys keep
+	// FIDESLIB_ROT_KEY_BAND. Bootstrap indexes (full_keep) stay full either way.
+	std::map<int, int> key_bands, n_band_hist;
+	if (const char* e = std::getenv("FIDESLIB_ROT_KEY_BANDS"); e && *e) {
+		std::ifstream f(e);
+		if (!f)
+			throw std::runtime_error(std::string("FIDESLIB_ROT_KEY_BANDS: cannot read ") + e);
+		std::stringstream ss;
+		ss << f.rdbuf();
+		const std::string s = ss.str();
+		for (size_t p = s.find('"'); p != std::string::npos; p = s.find('"', p)) {
+			const size_t q	   = s.find('"', p + 1);
+			const size_t colon = q == std::string::npos ? q : s.find(':', q);
+			if (colon == std::string::npos)
+				break;
+			const int idx	= std::stoi(s.substr(p + 1, q - p - 1));
+			const int limbs = std::stoi(s.substr(colon + 1));
+			if (limbs < 1)
+				throw std::runtime_error("FIDESLIB_ROT_KEY_BANDS: limb count < 1 for index " + std::to_string(idx));
+			if (idx < half_ring)  // the conjugation key (2N - 1) is logged too; it is not a model key
+				key_bands[norm_idx(idx)] = limbs - 1;
+			p = colon;
+		}
+		std::cout << "[N2] per-key bands for " << key_bands.size() << " rotation indexes from " << e << std::endl;
+	}
+	if (rot_band >= 0 || !key_bands.empty()) {
 		auto fhe_pre = std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(context->GetScheme()->m_FHE);
 		if (fhe_pre) {
 			for (const auto& [slots_pre, _] : fhe_pre->m_bootPrecomMap) {
@@ -639,18 +665,43 @@ void CryptoContextImpl<DCRTPoly>::LoadContext(const PublicKey<DCRTPoly>& publicK
 		std::cerr << "[rot_band] band=" << rot_band << " full_keep=" << full_keep.size()
 				  << " (precom entries=" << (fhe_pre ? fhe_pre->m_bootPrecomMap.size() : 0) << ")\n";
 	}
+	// FIDESLIB_ROT_KEYS_HOST=1 (lever L8): the model keys no bootstrap route uses live in pinned host memory and are
+	// fetched into a device LRU cache on use (ContextData::GetRotationKey); the bootstrap's keys stay resident.
+	if (const char* e = std::getenv("FIDESLIB_ROT_KEYS_HOST"); e && e[0] == '1' && this->devices.size() == 1) {
+		std::set<int> boot_l8;
+		if (auto fhe_l8 = std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(context->GetScheme()->m_FHE))
+			for (const auto& [slots_l8, _] : fhe_l8->m_bootPrecomMap)
+				for (int v : FIDESlib::CKKS::GetBootstrapIndexes(context, static_cast<int>(slots_l8), nullptr))
+					boot_l8.insert(norm_idx(v));
+		std::set<int> host_l8;
+		for (const auto& step : this->rotation_indexes)
+			if (norm_idx(step) != 0 && !boot_l8.count(norm_idx(step)))
+				host_l8.insert(norm_idx(step));
+		c->setRotKeysHostSteps(std::move(host_l8));
+	}
 	int n_banded = 0, n_full = 0;
 	for (const auto& step : this->rotation_indexes) {
 		if (deferred.count(step)) continue;
 		auto raw_rot_ksk = FIDESlib::CKKS::GetRotationKeySwitchKey(pkImpl, step);
 		FIDESlib::CKKS::KeySwitchingKey rot_ksk(c);
-		const bool full = rot_band < 0 || full_keep.count(norm_idx(step)) > 0;
+		const int  n_idx = norm_idx(step);
+		const auto kb	 = key_bands.find(n_idx);
+		const int  band	 = kb != key_bands.end() ? kb->second : rot_band;
+		const bool full	 = band < 0 || full_keep.count(n_idx) > 0;
 		(full ? n_full : n_banded)++;
-		rot_ksk.Initialize(raw_rot_ksk, full ? -1 : rot_band);
+		if (!full && kb != key_bands.end())
+			n_band_hist[band]++;
+		rot_ksk.Initialize(raw_rot_ksk, full ? -1 : band);
 		c->AddRotationKey(step, std::move(rot_ksk));
 	}
-	if (rot_band >= 0)
+	if (rot_band >= 0 || !key_bands.empty())
 		std::cerr << "[rot_band] model keys: banded=" << n_banded << " full=" << n_full << "\n";
+	if (!key_bands.empty()) {
+		std::cout << "[N2] per-key banded keys by band:";
+		for (const auto& [b, cnt] : n_band_hist)
+			std::cout << " " << b << ":" << cnt;
+		std::cout << std::endl;
+	}
 
 	// Bootstrapping precomputations.
 	auto fhe = std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(context->GetScheme()->m_FHE);
@@ -710,6 +761,7 @@ void CryptoContextImpl<DCRTPoly>::AddBootstrapRoute(const PublicKey<DCRTPoly>& p
 	auto& c = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
 	if (c->HasBootPrecomputation(slots))
 		return;
+	FIDESlib::CKKS::RequireHostKeys("AddBootstrapRoute");  // before the shared keys are removed below
 	auto& pkImpl = std::any_cast<const lbcrypto::PublicKey<lbcrypto::DCRTPoly>&>(publicKey->pimpl);
 	// the route needs full keys: drop any it shares with the (possibly banded) model keys, so they reload full
 	{
@@ -721,6 +773,24 @@ void CryptoContextImpl<DCRTPoly>::AddBootstrapRoute(const PublicKey<DCRTPoly>& p
 	}
 	FIDESlib::CKKS::AddBootstrapPrecomputation(pkImpl, slots, c);
 	c->ReleaseScratchOf(c->GetBootPrecomputationBase(slots));
+}
+
+size_t CryptoContextImpl<DCRTPoly>::FreeHostKeys() {
+	if (!this->loaded || this->devices.empty())
+		throw std::runtime_error("FreeHostKeys: the keys are not on the device yet (LoadContext first)");
+	if (!this->deferred_rotation_indexes.empty())
+		throw std::runtime_error("FreeHostKeys: deferred rotation keys still need their host copies (LoadRotationKeys)");
+	using CC = lbcrypto::CryptoContextImpl<lbcrypto::DCRTPoly>;
+	size_t n = 0;
+	for (const auto& [tag, m] : CC::GetAllEvalAutomorphismKeys())
+		if (m)
+			n += m->size();
+	for (const auto& [tag, v] : CC::GetAllEvalMultKeys())
+		n += v.size();
+	FIDESlib::CKKS::MarkHostKeysFreed();
+	CC::ClearEvalAutomorphismKeys();
+	CC::ClearEvalMultKeys();
+	return n;
 }
 
 size_t CryptoContextImpl<DCRTPoly>::DropBootstrapRoute(const PublicKey<DCRTPoly>& publicKey, int slots) {

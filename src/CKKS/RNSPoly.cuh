@@ -21,6 +21,12 @@ class RNSPoly {
    public:
     std::vector<LimbPartition> GPU;
     bool graphOwned = false;   // used inside a graph capture: lives in the graph pool, never back in the eager one
+    /** FIDESLIB_LEVEL_SIZED (lever L6): never trimmed to its level. Set on the context's key-switch / ModDown scratch
+     *  polys, which setLevel / copyShallow raise again without grow() and so need all their limbs. */
+    bool levelPinned = false;
+    /** FIDESLIB_LEVEL_SIZED (lever L6): release the limbs above the current level (no-op when the switch is off, the
+     *  poly is pinned or graph-owned, inside a graph capture, or on multi-GPU). */
+    void trimToLevel();
 
     explicit RNSPoly(ContextData& context, int level = -1, bool single_malloc = false, bool def_stream = false);
     explicit RNSPoly(ContextData& context, const std::vector<std::vector<uint64_t>>& data);
@@ -228,5 +234,11 @@ class RNSPoly {
                                        const std::vector<const RNSPoly*>& a0, const std::vector<const RNSPoly*>& a1,
                                        const std::vector<const RNSPoly*>& b0, const std::vector<const RNSPoly*>& b1);
 };
+/** FIDESLIB_LEVEL_SIZED (lever L6, default 0 = off): 1 = ciphertext limbs above the level go back to the pool at every
+ *  in-place level drop (rescale, fused ModDown+rescale, multPt+rescale); 2 = also at dropToLevel (level >= 0) and when
+ *  grow() meets a recycled poly holding more limbs than the new level, and hoisted-rotation outputs are grown to the
+ *  input's level instead of the top. Forced to 0 under FIDESLIB_BTS_GRAPH / FIDESLIB_FINISH_GRAPH (graphs replay into
+ *  fixed limb addresses). */
+int levelSizedMode();
 }  // namespace FIDESlib::CKKS
 #endif  //FIDESLIB_CKKS_RNSPOLY_CUH

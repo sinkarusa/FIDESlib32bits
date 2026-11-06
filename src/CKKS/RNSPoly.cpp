@@ -11,6 +11,8 @@
 
 #include <omp.h>
 #include <stdexcept>
+#include <algorithm>
+#include <atomic>
 
 #include "../parallel_for.hpp"
 
@@ -27,6 +29,8 @@ void RNSPoly::grow(int new_level, bool single_malloc, bool constant) {
     if (level >= new_level)
         return;
     level = new_level;
+    if (!constant && levelSizedMode() >= 2)
+        trimToLevel();   // L6: a recycled poly may hold more limbs than the new level
 
     // single_malloc = false;
     //if (level == -1) {
@@ -100,6 +104,70 @@ void RNSPoly::swap(RNSPoly& other) noexcept {
 
 int RNSPoly::getLevel() const {
     return level;
+}
+
+// FIDESLIB_LEVEL_SIZED (lever L6): see RNSPoly.cuh. FIDESLIB_LEVEL_SIZED_FENCE=1 (diagnostic): a device synchronize
+// before every release, so no unordered reader on another stream can still see the freed blocks (if a divergence goes
+// away with it, a missing stream edge is the cause, not the release itself).
+static bool levelSizedFence() {
+    static const bool v = [] { const char* e = std::getenv("FIDESLIB_LEVEL_SIZED_FENCE"); return e && std::atoi(e) > 0; }();
+    return v;
+}
+
+int levelSizedMode() {
+    static const int v = [] {
+        const char* e = std::getenv("FIDESLIB_LEVEL_SIZED");
+        const int m = (e && *e) ? std::min(std::atoi(e), 2) : 0;
+        if (m <= 0)
+            return 0;
+        auto on = [](const char* k) { const char* x = std::getenv(k); return x && std::atoi(x) > 0; };
+        if (on("FIDESLIB_BTS_GRAPH") || on("FIDESLIB_FINISH_GRAPH")) {
+            std::printf("[L6] FIDESLIB_LEVEL_SIZED=%d ignored: a bootstrap graph switch is on\n", m);
+            std::fflush(stdout);
+            return 0;
+        }
+        std::printf("[L6] level-sized ciphertexts: mode %d%s\n", m, levelSizedFence() ? ", fenced" : "");
+        std::fflush(stdout);
+        return m;
+    }();
+    return v;
+}
+
+namespace {
+std::atomic<long long> g_l6Limbs{0}, g_l6Calls{0};
+struct L6Summary {
+    ~L6Summary() {
+        if (g_l6Calls.load()) {
+            std::printf("[L6] released %lld limbs in %lld trims\n", g_l6Limbs.load(), g_l6Calls.load());
+            std::fflush(stdout);
+        }
+    }
+} g_l6Summary;
+}  // namespace
+
+void RNSPoly::trimToLevel() {
+    if (levelSizedMode() == 0 || levelPinned || graphOwned || FIDESlib::g_cap.active || GPU.size() != 1)
+        return;
+    LimbPartition& g = GPU[0];
+    const int keep = g.getLimbSize(level);
+    if ((int)g.limb.size() <= keep)
+        return;
+    if (levelSizedFence()) {   // and report a pending device fault here, before the pool mislabels it as OOM
+        const cudaError_t e = cudaDeviceSynchronize();
+        if (e != cudaSuccess) {
+            std::printf("[L6] CUDA error %s pending before a release (level %d, %d limbs)\n", cudaGetErrorName(e),
+                        level, (int)g.limb.size());
+            std::fflush(stdout);
+        }
+    }
+    const int n = g.releaseTopLimbs(keep);
+    if (n == 0)
+        return;
+    if (g_l6Calls.fetch_add(1) == 0) {
+        std::printf("[L6] first release: %d limbs above level %d\n", n, level);
+        std::fflush(stdout);
+    }
+    g_l6Limbs += n;
 }
 
 void RNSPoly::freeSpecialLimbs() {
@@ -313,6 +381,7 @@ void RNSPoly::rescale() {
     if (cc.compositeDegree() == 2 && GPU.size() == 1) {
         if (GPU[0].rescale2()) {
             level -= 2;
+            trimToLevel();   // L6
             return;
         }
     }
@@ -354,6 +423,7 @@ void RNSPoly::rescale() {
         level -= 1;
     }
     }  // composite loop
+    trimToLevel();   // L6
 }
 
 void RNSPoly::rescaleOne() {
@@ -361,6 +431,7 @@ void RNSPoly::rescaleOne() {
         throw std::runtime_error("RNSPoly::rescaleOne: single GPU only");
     GPU[0].rescale();
     level -= 1;
+    trimToLevel();   // L6
 }
 
 void RNSPoly::rescaleDouble(RNSPoly& poly) {
@@ -374,6 +445,8 @@ void RNSPoly::rescaleDouble(RNSPoly& poly) {
                 throw std::runtime_error("rescaleDouble: c0 took the fused double-drop but c1 did not");
             level -= 2;
             poly.level -= 2;
+            trimToLevel();   // L6
+            poly.trimToLevel();
             return;
         }
     }
@@ -435,6 +508,8 @@ void RNSPoly::rescaleDouble(RNSPoly& poly) {
         }
     }
     }  // composite loop
+    trimToLevel();   // L6
+    poly.trimToLevel();
 }
 
 void RNSPoly::multPt(const RNSPoly& p, bool rescale) {
@@ -469,6 +544,7 @@ void RNSPoly::multPt(const RNSPoly& p, bool rescale) {
             }
             --level;
         }
+        trimToLevel();   // L6
     } else {
 #pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
         for (size_t i = 0; i < cc.GPUid.size(); ++i) {
@@ -627,8 +703,10 @@ void RNSPoly::moddown(bool ntt, bool free, int aux_num, bool rescale2) {
         for (int i = 0; i < (int)GPU.size(); ++i) {
             GPU.at(i).moddown<algo>(cc.getModdownAux(aux_num).GPU.at(i), ntt, free, rescale2);
         }
-        if (rescale2)
+        if (rescale2) {
             level -= 2;  // the fused pass also dropped the composite pair
+            trimToLevel();   // L6
+        }
     } else {
         assert(!rescale2 && "fused ModDown+rescale is single-GPU only");
         RNSPoly& aux = cc.getModdownAux(aux_num);
@@ -950,18 +1028,14 @@ void RNSPoly::copyShallow(const RNSPoly& poly) {
 }
 
 void RNSPoly::dropToLevel(int level) {
-
-    if (0 && GPU.at(0).bufferLIMB == nullptr) {
-        for (auto& g : GPU) {
-            cudaSetDevice(g.device);
-            int limbSize = g.getLimbSize(level);
-            while ((int)g.limb.size() > limbSize) {
-                g.dropLimb();
-            }
-        }
-    }
+    const int from = this->level;
     if (this->level > level)
         this->level = level;
+    // L6 mode 2: only a poly that held data at a level (from >= 0). An empty one (level -1: a recycled poly the
+    // Ciphertext constructor reset, about to be filled by copy()) keeps its limbs for the grow that follows; with
+    // getLimbSize(-1) == 0 a trim would free all of them and the grow would allocate them again.
+    if (from >= 0 && level >= 0 && levelSizedMode() >= 2)
+        trimToLevel();
 }
 void RNSPoly::addMult(const RNSPoly& poly, const RNSPoly& poly1) {
     assert(level <= poly1.level && level <= poly.level);

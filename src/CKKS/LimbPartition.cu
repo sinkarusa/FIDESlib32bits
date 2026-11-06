@@ -2949,11 +2949,25 @@ void LimbPartition::binomialSquareFold(LimbPartition& c0_res, const LimbPartitio
     c2_key_switched_0.getS().wait(s);
     c2_key_switched_1.getS().wait(s);
 }
-void LimbPartition::dropLimb() {
+int LimbPartition::releaseTopLimbs(const int keep) {
+    const int n = (int)limb.size();
+    if (keep < 0 || n <= keep || bufferLIMB != nullptr)
+        return 0;
+    int aux_size = 0;
+    SWITCH_RET(limb.at(keep), aux.size, aux_size);
+    if (aux_size == 0)
+        return 0;   // constant (plaintext) limbs
     cudaSetDevice(device);
-
-    STREAM(limb.back()).wait(s);
-    limb.pop_back();
+    // Every op that touched these limbs ends joined into `s` (the limbs' own stream), so the frees below are ordered
+    // after it, and a pooled block is only handed out again after its freeing stream reached the free. The device
+    // tables stop naming the freed blocks: a kernel indexing past the level faults instead of writing a live buffer.
+    cudaMemsetAsync(limbptr.data + keep, 0, (size_t)(n - keep) * sizeof(void*), s.ptr());
+    cudaMemsetAsync(auxptr.data + keep, 0, (size_t)(n - keep) * sizeof(void*), s.ptr());
+    while ((int)limb.size() > keep) {
+        STREAM(limb.back()).wait(s);
+        limb.pop_back();
+    }
+    return n - keep;
 }
 void LimbPartition::addMult(const LimbPartition& a, const LimbPartition& b) {
     const int limbsize = getLimbSize(*level);

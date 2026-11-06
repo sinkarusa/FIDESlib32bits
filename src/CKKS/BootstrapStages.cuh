@@ -40,6 +40,10 @@ int btsStcFirstEntry(Ciphertext& ctxt, int slots);
 void btsStcFirstInput(Ciphertext& ctxt, const BtsState& st, bool ownCf = false);
 // StC outside a bootstrap, output at limb outLimb; skipMask bit s skips stage s (SinC encoding)
 void btsStcHigh(Ciphertext& ctxt, int slots, int outLimb, double factor, int skipMask = 0, double nfRef = 0);
+// Free StC plaintext caches (after a device sync): firstRef = stc_first / stc_alt last-stage entries at the reference
+// CF (cfStage >= 20, the non-ownCf ones), every route and raise variant; high = every btsStcHigh entry. Rebuilt on the
+// next miss. Returns the number of entries dropped.
+size_t btsStcCacheFree(Context& cc, bool firstRef, bool high);
 void btsModRaise(Ciphertext& ctxt, BtsState& st);
 void btsFold(Ciphertext& ctxt, const BtsState& st);
 void btsCtSStage(Ciphertext& ctxt, const BtsState& st, int k);

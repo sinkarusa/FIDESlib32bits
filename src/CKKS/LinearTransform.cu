@@ -884,8 +884,10 @@ static RNSPoly& batchKsAux(ContextData& cc, int c) {
         return cc.getKeySwitchAux();
     static std::map<ContextData*, std::vector<std::unique_ptr<RNSPoly>>> pool;
     auto& v = pool[&cc];
-    while ((int)v.size() < c)
+    while ((int)v.size() < c) {
         v.push_back(std::make_unique<RNSPoly>(cc, cc.L, false));
+        v.back()->levelPinned = true;   // L6: setLevel raises it without grow()
+    }
     RNSPoly& p = *v[c - 1];
     p.generateDecompAndDigit(false);
     p.generateSpecialLimbs(false, false);
@@ -900,6 +902,7 @@ static bool hoistRotateBatch(const std::vector<Ciphertext*>& cts, std::vector<Ci
     ContextData& cc = x0.cc;
     if (!hoistRotateFused || cc.GPUid.size() != 1 || K < 2 || K > 4)
         return false;
+    ContextData::RotKeyScope rotKeyScope(cc);  // L8: every gathered key stays resident until the dots are enqueued
     for (auto* c : cts)
         if (c->getLevel() != x0.getLevel() || c->keyID != x0.keyID || c->slots != x0.slots ||
             c->c0.isModUp() != x0.c0.isModUp())
@@ -912,6 +915,7 @@ static bool hoistRotateBatch(const std::vector<Ciphertext*>& cts, std::vector<Ci
     for (int i = 0; i < bStep; ++i)
         if (indexes[i] != 0) {
             auto& ksk = cc.GetRotationKey(indexes[i], x0.keyID, x0.slots);
+            NoteRotKeyUse(ksk, x0.c1.getLevel() + 1);  // FIDESLIB_ROT_LIMB_LOG
             ka.push_back(&ksk.a.GPU[0]);
             kb.push_back(&ksk.b.GPU[0]);
             kidx.push_back(indexes[i] == 2 * cc.N - 1 ? 2 * cc.N - 1 : x0.c0.automorph_index_precomp(indexes[i]));
@@ -924,7 +928,7 @@ static bool hoistRotateBatch(const std::vector<Ciphertext*>& cts, std::vector<Ci
         Ciphertext& x = *cts[c];
         for (int i = 0; i < bStep; ++i) {
             Ciphertext* r = rot[c * bStep + i];
-            r->growToLevel(cc.L);
+            r->growToLevel(levelSizedMode() >= 2 ? x.c0.getLevel() : cc.L);   // L6 mode 2: no full grow to drop again
             r->dropToLevel(x.c0.getLevel());
             if (ext) {
                 r->c0.generateSpecialLimbs(false, false);

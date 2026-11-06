@@ -88,6 +88,10 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	void AddBootstrapRoute(const PublicKey<DCRTPoly>& publicKey, int slots);
 	/// Drop a sparse route and the rotation keys only it uses; returns the keys freed.
 	size_t DropBootstrapRoute(const PublicKey<DCRTPoly>& publicKey, int slots);
+	/// PF_FREE_HOST_KEYS (lever H1): drop OpenFHE's host copies of every eval key (relinearization + automorphism
+	/// maps) once all of them are on the device; any later host key read throws (RequireHostKeys). Returns the number
+	/// of host keys dropped. Throws before LoadContext or while deferred rotation keys are pending.
+	size_t FreeHostKeys();
 	/// @brief GPU-load a set of rotation keys that were deferred at LoadContext time
 	/// (their OpenFHE eval keys already exist; this is the device transfer only).
 	/// Dedups against already-resident keys. Used to lazily bring in the decode

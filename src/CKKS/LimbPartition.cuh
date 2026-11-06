@@ -315,7 +315,11 @@ class LimbPartition {
                             const LimbPartition& c2_key_switched_1);
     void addScalar(std::vector<uint64_t>& vector);
     void subScalar(std::vector<uint64_t>& vector);
-    void dropLimb();
+    /** FIDESLIB_LEVEL_SIZED (lever L6): give the limbs at index >= keep back to the pool (v and aux), stream-ordered
+     *  on `s`, and null their device-table entries (limbptr / auxptr). Only per-limb pooled limbs that own an aux
+     *  buffer (ciphertext limbs); single-buffer and constant (plaintext) partitions are left alone. Returns the
+     *  number of limbs released. */
+    int releaseTopLimbs(int keep);
     void addMult(const LimbPartition& partition, const LimbPartition& partition1);
     void broadcastLimb0();
     /** COMPOSITESCALING ModRaise: CRT-extend the bottom d limbs across ALL current limbs

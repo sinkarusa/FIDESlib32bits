@@ -120,6 +120,14 @@ void GetOpenFHEPlaintext(lbcrypto::Plaintext result, RawPlainText raw, int REV =
 // RawParams GetRawParams(lbcrypto::CryptoContext<lbcrypto::DCRTPoly> cc);
 RawParams GetRawParams(lbcrypto::CryptoContext<lbcrypto::DCRTPoly> cc, FIDESlib::BOOT_CONFIG boot_conf = UNIFORM);
 
+/** PF_FREE_HOST_KEYS (lever H1): CryptoContextImpl::FreeHostKeys clears OpenFHE's host eval-key maps once every key is
+ *  on the device and calls MarkHostKeysFreed; from then on every host key read below (GetKeySwitchKey and the Get*KeySwitchKey
+ *  / AddBootstrapKeys lookups behind LoadRotationKeys, AddBootstrapRoute, AddRotationKeys) throws instead of loading an
+ *  empty key. RequireHostKeys(who) is that check. */
+void MarkHostKeysFreed();
+bool HostKeysFreed();
+void RequireHostKeys(const char* who);
+
 RawKeySwitchKey GetKeySwitchKey(std::shared_ptr<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>> ksk);
 
 RawKeySwitchKey GetEvalKeySwitchKey(const lbcrypto::KeyPair<lbcrypto::DCRTPoly>& keys);

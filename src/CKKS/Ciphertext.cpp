@@ -1062,12 +1062,14 @@ void Ciphertext::extend(bool init) {
 void Ciphertext::rotate(const int index_, const bool moddown) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
 	CKKS::SetCurrentContext(cc_);
+	ContextData::RotKeyScope rotKeyScope(cc);  // L8: the key stays resident until the dot is enqueued
 	op_count[OPS::ROTATE]++;
 	int index = normalyzeIndex(index_);
 
 	assert(index != 0);
 	constexpr bool PRINT	= false;
 	KeySwitchingKey& kskRot = cc.GetRotationKey(index, keyID, slots);
+	NoteRotKeyUse(kskRot, c1.getLevel() + 1);  // FIDESLIB_ROT_LIMB_LOG
 
 	if (0 && cc.GPUid.size() == 1) {
 		if constexpr (0) {
@@ -1239,6 +1241,7 @@ void Ciphertext::rotate(const Ciphertext& c, const int index) {
 void Ciphertext::rotateFrom(const Ciphertext& c, const int index_) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
 	CKKS::SetCurrentContext(cc_);
+	ContextData::RotKeyScope rotKeyScope(cc);  // L8: the key stays resident until the dot is enqueued
 	assert(this != &c);
 	op_count[OPS::ROTATE]++;
 	c0.dropToLevel(c.c0.getLevel());
@@ -1256,6 +1259,7 @@ void Ciphertext::rotateFrom(const Ciphertext& c, const int index_) {
 	std::vector<RNSPoly*> c0_out{ &c0 };
 	std::vector<RNSPoly*> c1_out{ &c1 };
 	auto& ksk = cc.GetRotationKey(index, c.keyID, slots);
+	NoteRotKeyUse(ksk, c.c1.getLevel() + 1);  // FIDESLIB_ROT_LIMB_LOG
 	std::vector<RNSPoly*> ksk_a{ &ksk.a };
 	std::vector<RNSPoly*> ksk_b{ &ksk.b };
 	in1.hoistedRotationFused(index_v, c0_out, c1_out, ksk_a, ksk_b, c.c0, in1);
@@ -1387,6 +1391,7 @@ void Ciphertext::rotate_hoisted_chunked(const std::vector<int>& indexes_, std::v
                                         const std::function<void(int part, int begin, int count)>& on_chunk) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
 	CKKS::SetCurrentContext(cc_);
+	ContextData::RotKeyScope rotKeyScope(cc);  // L8: every gathered key stays resident until the dots are enqueued
 	assert(hoistRotateFused && cc.GPUid.size() == 1 && chunk > 0);
 	assert(indexes_.size() == results.size());
 	op_count[OPS::HOISTEDROTATE]++;
@@ -1397,7 +1402,7 @@ void Ciphertext::rotate_hoisted_chunked(const std::vector<int>& indexes_, std::v
 		indexes.push_back(normalyzeIndex(i));
 
 	for (auto& i : results) {
-		i->growToLevel(cc.L);
+		i->growToLevel(levelSizedMode() >= 2 ? this->c0.getLevel() : cc.L);	 // L6 mode 2: no full grow to drop again
 		i->dropToLevel(this->c0.getLevel());
 		i->c0.generateSpecialLimbs(false, false);
 		i->c1.generateSpecialLimbs(false, false);
@@ -1421,6 +1426,7 @@ void Ciphertext::rotate_hoisted_chunked(const std::vector<int>& indexes_, std::v
 			c0_out.push_back(&results[i]->c0);
 			c1_out.push_back(&results[i]->c1);
 			auto& ksk = cc.GetRotationKey(indexes[i], keyID, slots);
+			NoteRotKeyUse(ksk, c1.getLevel() + 1);  // FIDESLIB_ROT_LIMB_LOG
 			ksk_a.push_back(&ksk.a);
 			ksk_b.push_back(&ksk.b);
 			index.push_back(indexes[i]);
@@ -1468,6 +1474,7 @@ void Ciphertext::rotateSumHoisted(const std::vector<int>& indexes) {
 }
 
 void Ciphertext::rotate_hoisted(const std::vector<int>& indexes_, std::vector<Ciphertext*> results, const bool ext) {
+	ContextData::RotKeyScope rotKeyScope(cc);  // L8: every gathered key stays resident until the dots are enqueued
 	std::vector<int> indexes;
 	for (auto i : indexes_) {
 		indexes.push_back(normalyzeIndex(i));
@@ -1481,7 +1488,7 @@ void Ciphertext::rotate_hoisted(const std::vector<int>& indexes_, std::vector<Ci
 	constexpr bool PRINT = false;
 	assert(indexes.size() == results.size());
 
-	bool grow_full = true;
+	const bool grow_full = levelSizedMode() < 2;  // L6 mode 2: no full grow to drop again
 	for (auto& i : results) {
 		i->growToLevel(grow_full ? cc.L : this->c0.getLevel());
 		i->dropToLevel(this->c0.getLevel());
@@ -1522,7 +1529,9 @@ void Ciphertext::rotate_hoisted(const std::vector<int>& indexes_, std::vector<Ci
 						results[i]->extend();
 					}
 				} else {
-					RNSPoly& aux0 = results[i]->c1.dotKSKInPlaceFrom(cc.getKeySwitchAux(), cc.GetRotationKey(indexes[i], keyID, slots), &c1);
+					KeySwitchingKey& ksk = cc.GetRotationKey(indexes[i], keyID, slots);
+					NoteRotKeyUse(ksk, c1.getLevel() + 1);  // FIDESLIB_ROT_LIMB_LOG
+					RNSPoly& aux0 = results[i]->c1.dotKSKInPlaceFrom(cc.getKeySwitchAux(), ksk, &c1);
 					// results[i]->c0.dropToLevel(getLevel());
 					// results[i]->c1.dropToLevel(getLevel());
 					if (!ext)
@@ -1557,7 +1566,9 @@ void Ciphertext::rotate_hoisted(const std::vector<int>& indexes_, std::vector<Ci
 						results[i]->extend();
 					}
 				} else {
-					RNSPoly& aux0 = in.dotKSKInPlace(cc.GetRotationKey(indexes[i], keyID, slots), &c1);
+					KeySwitchingKey& ksk = cc.GetRotationKey(indexes[i], keyID, slots);
+					NoteRotKeyUse(ksk, c1.getLevel() + 1);  // FIDESLIB_ROT_LIMB_LOG
+					RNSPoly& aux0 = in.dotKSKInPlace(ksk, &c1);
 					// results[i]->c0.dropToLevel(getLevel());
 					// results[i]->c1.dropToLevel(getLevel());
 					if (!ext) {
@@ -1626,6 +1637,7 @@ void Ciphertext::rotate_hoisted(const std::vector<int>& indexes_, std::vector<Ci
 				c0_out.push_back(&results[i]->c0);
 				c1_out.push_back(&results[i]->c1);
 				auto& ksk = cc.GetRotationKey(indexes[i], keyID, slots);
+				NoteRotKeyUse(ksk, c1.getLevel() + 1);  // FIDESLIB_ROT_LIMB_LOG
 				ksk_a.push_back(&ksk.a);
 				ksk_b.push_back(&ksk.b);
 				index.push_back(indexes[i]);

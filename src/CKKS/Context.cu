@@ -379,8 +379,11 @@ RNSPoly& ContextData::getKeySwitchAux() {
     auto& p = ksLane() ? key_switch_aux_ln[ksLane() % kKsLanes] : key_switch_aux;
     if (p == nullptr) {
         std::lock_guard<std::mutex> g(ks_aux_init_mtx);
-        if (p == nullptr)
-            p = std::make_unique<RNSPoly>(*this, L, false);
+        if (p == nullptr) {
+            auto q = std::make_unique<RNSPoly>(*this, L, false);
+            q->levelPinned = true;   // L6: setLevel / copyShallow raise it without grow()
+            p = std::move(q);
+        }
     }
 
     p->generateDecompAndDigit(false);
@@ -392,8 +395,11 @@ RNSPoly& ContextData::getKeySwitchAux2() {
     auto& p = ksLane() ? key_switch_aux2_ln[ksLane() % kKsLanes] : key_switch_aux2;
     if (p == nullptr) {
         std::lock_guard<std::mutex> g(ks_aux_init_mtx);
-        if (p == nullptr)
-            p = std::make_unique<RNSPoly>(*this, L, false);
+        if (p == nullptr) {
+            auto q = std::make_unique<RNSPoly>(*this, L, false);
+            q->levelPinned = true;   // L6: setLevel raises it without grow()
+            p = std::move(q);
+        }
     }
     p->generateDecompAndDigit(false);
     p->generateSpecialLimbs(false, false);
@@ -404,8 +410,11 @@ RNSPoly& ContextData::getModdownAux(const int num) {
     auto& p = (ksLane() ? moddown_aux_ln[ksLane() % kKsLanes] : moddown_aux)[num & 1];
     if (p == nullptr) {
         std::lock_guard<std::mutex> g(ks_aux_init_mtx);
-        if (p == nullptr)
-            p = std::make_unique<RNSPoly>(*this, L, false);
+        if (p == nullptr) {
+            auto q = std::make_unique<RNSPoly>(*this, L, false);
+            q->levelPinned = true;   // L6: ModDown reads its table at the caller's level
+            p = std::move(q);
+        }
     }
     p->generateSpecialLimbs(false, true);
     return *p;
@@ -794,7 +803,7 @@ KeySwitchingKey& ContextData::GetRotationKey(int index, const KeyHash& keyID, in
                 for (int i = 1; i < N / 2 / slots; ++i) {
                     int index_ = (index + i * slots) % (N / 2);
                     if (precom.keys.at(keyID).rot_keys.contains(index_)) {
-                        return precom.keys.at(keyID).rot_keys.at(index_);
+                        return rotKeyUse(precom.keys.at(keyID).rot_keys.at(index_));
                     }
                 }
             }
@@ -802,7 +811,7 @@ KeySwitchingKey& ContextData::GetRotationKey(int index, const KeyHash& keyID, in
         }
     }
 
-    return precom.keys.at(keyID).rot_keys.at(index);
+    return rotKeyUse(precom.keys.at(keyID).rot_keys.at(index));
 }
 void ContextData::AddRotationKey(int index, KeySwitchingKey&& ksk) {
     //index = index % (cc.N / 2);
@@ -810,7 +819,10 @@ void ContextData::AddRotationKey(int index, KeySwitchingKey&& ksk) {
         index += this->N / 2;
     if (!precom.keys.contains(ksk.keyID))
         precom.keys[ksk.keyID] = Precomputations::KeyPrecomputations{};
-    precom.keys.at(ksk.keyID).rot_keys.emplace(index, std::move(ksk));
+    ksk.rot_index = index;  // FIDESLIB_ROT_LIMB_LOG key
+    auto ins = precom.keys.at(ksk.keyID).rot_keys.emplace(index, std::move(ksk));
+    if (ins.second && rotKeysHostSteps.count(index))
+        rotKeysHostAdopt(ins.first->second);
 }
 bool ContextData::HasRotationKey(int index, const KeyHash& keyID) {
     //index = index % (cc.N / 2);
@@ -826,7 +838,120 @@ bool ContextData::RemoveRotationKey(int index, const KeyHash& keyID) {
     auto it = precom.keys.find(keyID);
     if (it == precom.keys.end())
         return false;
+    rotKeysHostSteps.erase(index);   // L8: a reload (e.g. a bootstrap route that needs it full) stays resident
     return it->second.rot_keys.erase(index) > 0;   // dtor frees the GPU limbs
+}
+
+namespace {
+struct RotKeysHostStats {
+    uint64_t keys = 0, ineligible = 0, pinned = 0, fetches = 0, bytes = 0, evictions = 0, hits = 0, overBudget = 0;
+    size_t budget = 0, peak = 0;
+};
+RotKeysHostStats& rotKeysHostStats() {
+    static RotKeysHostStats s;
+    return s;
+}
+void rotKeysHostReport() {
+    const RotKeysHostStats& s = rotKeysHostStats();
+    std::printf("[L8] fetches %llu bytes %llu\n", (unsigned long long)s.fetches, (unsigned long long)s.bytes);
+    std::printf("[L8] keys %llu (ineligible %llu) pinned %.3f GB, budget %.3f GB, peak resident %.3f GB, hits %llu, "
+                "evictions %llu, fetches over budget %llu, PCIe at 20 GB/s %.2f s\n",
+                (unsigned long long)s.keys, (unsigned long long)s.ineligible, s.pinned / 1e9, s.budget / 1e9,
+                s.peak / 1e9, (unsigned long long)s.hits, (unsigned long long)s.evictions,
+                (unsigned long long)s.overBudget, s.bytes / 20e9);
+    std::fflush(stdout);
+}
+}  // namespace
+
+void ContextData::setRotKeysHostSteps(std::set<int> steps) {
+    rotKeysHostSteps = std::move(steps);
+    if (rotKeysHostSteps.empty())
+        return;
+    const char* e = std::getenv("FIDESLIB_ROT_KEYS_DEV_GB");
+    const double gb = (e && *e) ? std::atof(e) : 2.0;
+    rotKeysDevBudget = static_cast<size_t>(std::max(0.0, gb) * 1e9);
+    static std::once_flag once;
+    std::call_once(once, [] {
+        rotKeysHostStats();
+        std::atexit(rotKeysHostReport);
+    });
+    rotKeysHostStats().budget = rotKeysDevBudget;
+    std::printf("[L8] host-backed rotation keys: %zu model steps, device budget %.3f GB\n", rotKeysHostSteps.size(),
+                rotKeysDevBudget / 1e9);
+    std::fflush(stdout);
+}
+
+void ContextData::rotKeysHostAdopt(KeySwitchingKey& k) {
+    RotKeysHostStats& s = rotKeysHostStats();
+    if (k.hostOffload()) {
+        ++s.keys;
+        s.pinned += k.host->bytes;
+    } else {
+        ++s.ineligible;
+    }
+}
+
+KeySwitchingKey& ContextData::rotKeyUse(KeySwitchingKey& k) {
+    if (!k.host)
+        return k;
+    KeyHostImage& h = *k.host;
+    h.lastUse = ++rotKeysClock;
+    if (rotKeysScopeDepth > 0)
+        h.scope = rotKeysScopeId;
+    if (FIDESlib::g_cap.active) {
+        // a graph would bake in this key's device copy, which a later eviction frees; nor can a capture fetch.
+        // The eager re-run after the failed capture fetches it.
+        FIDESlib::captureInvalidate("L8: host-backed rotation key");
+        return k;
+    }
+    RotKeysHostStats& s = rotKeysHostStats();
+    if (k.hostResident()) {
+        ++s.hits;
+        return k;
+    }
+    // make room: evict the least recently used resident host-backed keys outside the open scope
+    size_t resident = 0;
+    std::vector<KeySwitchingKey*> lru;
+    for (auto& [id, kp] : precom.keys)
+        for (auto& [i, rk] : kp.rot_keys)
+            if (rk.host && &rk != &k && rk.hostResident()) {
+                resident += rk.host->bytes;
+                if (rotKeysScopeDepth == 0 || rk.host->scope != rotKeysScopeId)
+                    lru.push_back(&rk);
+            }
+    if (resident + h.bytes > rotKeysDevBudget) {
+        std::sort(lru.begin(), lru.end(), [](const KeySwitchingKey* x, const KeySwitchingKey* y) {
+            return x->host->lastUse < y->host->lastUse;
+        });
+        for (KeySwitchingKey* v : lru) {
+            if (resident + h.bytes <= rotKeysDevBudget)
+                break;
+            v->hostEvict();
+            resident -= v->host->bytes;
+            ++s.evictions;
+        }
+        if (resident + h.bytes > rotKeysDevBudget)
+            ++s.overBudget;   // the open scope holds more than the budget: exceed it until the scope closes
+    }
+    k.hostFetch();
+    ++s.fetches;
+    s.bytes += h.bytes;
+    s.peak = std::max(s.peak, resident + h.bytes);
+    if (s.fetches % 1000 == 0) {
+        std::printf("[L8] fetches %llu bytes %llu evictions %llu\n", (unsigned long long)s.fetches,
+                    (unsigned long long)s.bytes, (unsigned long long)s.evictions);
+        std::fflush(stdout);
+    }
+    return k;
+}
+
+ContextData::RotKeyScope::RotKeyScope(ContextData& c) : cc(c) {
+    if (cc.rotKeysScopeDepth++ == 0)
+        ++cc.rotKeysScopeId;
+}
+
+ContextData::RotKeyScope::~RotKeyScope() {
+    --cc.rotKeysScopeDepth;
 }
 
 void ContextData::AddEvalKey(KeySwitchingKey&& ksk) {
