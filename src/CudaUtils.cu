@@ -891,15 +891,17 @@ static bool pool_null_edge_on() {
     }();
     return v;
 }
-static bool pool_poison_on() {
-    static const bool v = [] {
+// FIDESLIB_POOL_POISON: 0 off, 1 the first 4 KiB of each freed block, 2 the whole block
+static int pool_poison_mode() {
+    static const int v = [] {
         const char* e = std::getenv("FIDESLIB_POOL_POISON");
-        const bool on = e && std::atoi(e) > 0;
-        if (on) {
-            std::printf("[pool_race] FIDESLIB_POOL_POISON: pooled frees poison the first 4 KiB of each block\n");
+        const int m = e ? std::max(0, std::min(2, std::atoi(e))) : 0;
+        if (m) {
+            std::printf("[pool_race] FIDESLIB_POOL_POISON=%d: pooled frees poison %s of each block\n", m,
+                        m == 2 ? "all" : "the first 4 KiB");
             std::fflush(stdout);
         }
-        return on;
+        return m;
     }();
     return v;
 }
@@ -938,7 +940,7 @@ void poolRaceCount(PoolRace c) {
 /* FIDESLIB_POOL_POISON (mempool_lock[id] held): overwrite a freed block where the pool's ordering edge for it sits, so
  * that a reader not ordered before that edge reads 0xFFFFFFFF (above every prime) instead of stale data. */
 static void pool_poison(void* ptr, int id, int bytes, cudaStream_t stream) {
-    const size_t n = std::min<size_t>((size_t)bytes, 4096);
+    const size_t n = pool_poison_mode() == 2 ? (size_t)bytes : std::min<size_t>((size_t)bytes, 4096);
     if (stream != nullptr) {   // on the freeing stream, before the pool stream waits on it
         cudaMemsetAsync(ptr, 0xFF, n, stream);
     } else if (pool_null_edge_on()) {   // on the legacy stream, before the legacy-stream edge recorded below
@@ -1128,7 +1130,7 @@ void GPUfree(void* ptr, int id, int bytes, cudaStream_t stream, bool cache) {
 
         CudaCheckErrorModNoSync;
         // cudaDeviceSynchronize();
-        if (pool_poison_on())
+        if (pool_poison_mode())
             pool_poison(ptr, id, bytes, stream);
         if (stream != nullptr) {
             s[id].wait(stream);

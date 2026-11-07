@@ -1354,6 +1354,28 @@ void ContextData::returnAuxilarPoly(RNSPoly&& c) {
         FIDESlib::poolRaceCount(FIDESlib::PoolRace::AuxCapDestroy);
         return;   // not taken: the caller (Ciphertext::~Ciphertext) destroys it with its members
     }
+    // FIDESLIB_RECYCLE_POISON=1 (ordering diagnostic, off by default): overwrite a recycled polynomial's limbs with 0xFF
+    // on its own stream, after the work joined into it. A reader on another stream that never joined back (so the poly
+    // was recycled under it) then reads values above every prime instead of stale data.
+    static const bool recycle_poison = [] {
+        const char* e = std::getenv("FIDESLIB_RECYCLE_POISON");
+        const bool on = e && std::atoi(e) > 0;
+        if (on) {
+            std::printf("[pool_race] FIDESLIB_RECYCLE_POISON: recycled polynomials are poisoned on their stream\n");
+            std::fflush(stdout);
+        }
+        return on;
+    }();
+    if (recycle_poison)
+        for (auto& part : c.GPU)
+            for (auto& l : part.limb)
+                std::visit([&](auto& x) {
+                    const size_t n = (size_t)x.v.alloc * sizeof(x.v.data[0]);
+                    if (x.v.data)
+                        cudaMemsetAsync(x.v.data, 0xFF, n, part.s.ptr());
+                    if (x.aux.data)
+                        cudaMemsetAsync(x.aux.data, 0xFF, n, part.s.ptr());
+                }, l);
     precom.auxPoly.emplace_back(std::move(c));
 }
 
