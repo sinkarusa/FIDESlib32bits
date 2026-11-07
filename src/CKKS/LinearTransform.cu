@@ -338,6 +338,7 @@ void FIDESlib::CKKS::LinearTransform(Ciphertext& ctxt, int rowSize, int bStep, c
                                                               Aptr[i * bStep + j]->slots});
                     }
                 } else {
+                    FIDESlib::poolRaceCount(FIDESlib::PoolRace::LtDotUnchunked);
                     DotProductPtInternal<Ciphertext*, Plaintext*>(results, fastRotationPtr, Aptr, bStep, 1, gStep,
                                                                   MODDOWN_HOIST && ext);
                 }

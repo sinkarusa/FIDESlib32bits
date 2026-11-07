@@ -11,6 +11,8 @@
 //
 
 #include <atomic>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <algorithm>
@@ -610,6 +612,9 @@ std::map<int, std::vector<void*>>* const size_to_memory = new std::map<int, std:
 
 FIDESlib::Stream* const s = new FIDESlib::Stream[8];
 
+// FIDESLIB_POOL_POISON only: per device, the blocking stream that poisons blocks freed with a null stream
+FIDESlib::Stream* const poison_s = new FIDESlib::Stream[8];
+
 /* Slab bookkeeping for the pooled path: a pooled size class is served from slabs (cudaMallocAsync'd chunks carved
  * into equal blocks), and a block freed goes back to its class's free list. Without this a slab was never released,
  * so a class that stopped being used (a phase of the computation, a bootstrap route, a cache length) kept its memory
@@ -646,7 +651,7 @@ static size_t pool_trim_locked(int id) {
         }
         char* lo = it->first;
         char* hi = lo + (size_t)sl.block * sl.nblocks;
-        auto& fl = size_to_memory[id][sl.block];
+        auto& fl = size_to_memory[id][sl.block];   // (a FIDESLIB_POOL_RACE_STATS tag bit keeps an entry in its block)
         fl.erase(std::remove_if(fl.begin(), fl.end(), [&](void* p) { return (char*)p >= lo && (char*)p < hi; }),
                  fl.end());
         // ordered after every free of its blocks: GPUfree makes the pool stream wait on the freeing stream
@@ -873,6 +878,81 @@ void pinnedHostFree(void* p) {
     cudaFreeHost(p);
 }
 
+/* Pool ordering diagnostics (see CudaUtils.cuh). Each switch is read once; with none set the pooled path is unchanged. */
+static bool pool_null_edge_on() {
+    static const bool v = [] {
+        const char* e = std::getenv("FIDESLIB_POOL_NULL_EDGE");
+        const bool on = e && std::atoi(e) > 0;
+        if (on) {
+            std::printf("[pool_race] FIDESLIB_POOL_NULL_EDGE: null-stream frees ordered through the legacy stream\n");
+            std::fflush(stdout);
+        }
+        return on;
+    }();
+    return v;
+}
+static bool pool_poison_on() {
+    static const bool v = [] {
+        const char* e = std::getenv("FIDESLIB_POOL_POISON");
+        const bool on = e && std::atoi(e) > 0;
+        if (on) {
+            std::printf("[pool_race] FIDESLIB_POOL_POISON: pooled frees poison the first 4 KiB of each block\n");
+            std::fflush(stdout);
+        }
+        return on;
+    }();
+    return v;
+}
+bool poolRaceStatsOn() {
+    static const bool v = [] { const char* e = std::getenv("FIDESLIB_POOL_RACE_STATS"); return e && std::atoi(e) > 0; }();
+    return v;
+}
+
+namespace {
+std::atomic<long long> g_poolRace[(int)PoolRace::Count]{};
+struct PoolRaceSummary {
+    ~PoolRaceSummary() {
+        if (!poolRaceStatsOn())
+            return;
+        auto n = [](PoolRace c) { return g_poolRace[(int)c].load(); };
+        std::printf("[pool_race] pooled frees: null stream %lld, stream %lld | pops by a stream of a null-freed block %lld"
+                    " | aux cap destroys %lld | unchunked LT dots %lld | adjust temporaries: multPt %lld addPt %lld"
+                    " subPt %lld\n",
+                    n(PoolRace::NullFree), n(PoolRace::StreamFree), n(PoolRace::NullToStreamPop),
+                    n(PoolRace::AuxCapDestroy), n(PoolRace::LtDotUnchunked), n(PoolRace::MultPtAdjust),
+                    n(PoolRace::AddPtAdjust), n(PoolRace::SubPtAdjust));
+        std::fflush(stdout);
+    }
+} g_poolRaceSummary;
+
+// FIDESLIB_POOL_RACE_STATS: a free-list entry whose last free had a null stream carries this bit (blocks are >= 1 KiB
+// apart, so the low bit of a block address is always clear)
+constexpr uintptr_t kNullFreedTag = 1;
+}  // namespace
+
+void poolRaceCount(PoolRace c) {
+    if (poolRaceStatsOn())
+        g_poolRace[(int)c].fetch_add(1, std::memory_order_relaxed);
+}
+
+/* FIDESLIB_POOL_POISON (mempool_lock[id] held): overwrite a freed block where the pool's ordering edge for it sits, so
+ * that a reader not ordered before that edge reads 0xFFFFFFFF (above every prime) instead of stale data. */
+static void pool_poison(void* ptr, int id, int bytes, cudaStream_t stream) {
+    const size_t n = std::min<size_t>((size_t)bytes, 4096);
+    if (stream != nullptr) {   // on the freeing stream, before the pool stream waits on it
+        cudaMemsetAsync(ptr, 0xFF, n, stream);
+    } else if (pool_null_edge_on()) {   // on the legacy stream, before the legacy-stream edge recorded below
+        cudaMemsetAsync(ptr, 0xFF, n, cudaStreamLegacy);
+    } else {
+        // no edge: a blocking stream of its own (after earlier legacy-stream work only), where a blocking-stream pop of
+        // this block may run. The pool stream waits on it, so the next owner's writes come after the poison.
+        if (poison_s[id].ptr() == nullptr)
+            poison_s[id].init();
+        cudaMemsetAsync(ptr, 0xFF, n, poison_s[id].ptr());
+        s[id].wait(poison_s[id]);
+    }
+}
+
 //void* GPUmalloc(int id, int bytes, cudaStream_t stream, FIDESlib::CKKS::Context& cc) {
 void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
     if (g_cap.active)
@@ -947,6 +1027,11 @@ void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
         CudaCheckErrorModNoSync;
         ptr = free_limb.back();
         free_limb.pop_back();
+        if (poolRaceStatsOn() && (reinterpret_cast<uintptr_t>(ptr) & kNullFreedTag)) {
+            ptr = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(ptr) & ~kNullFreedTag);
+            if (stream != nullptr)
+                poolRaceCount(PoolRace::NullToStreamPop);
+        }
         if (PoolSlab* sl = slab_of(id, ptr))
             sl->nfree--;
         if (pool_trace_on()) {
@@ -1043,11 +1128,23 @@ void GPUfree(void* ptr, int id, int bytes, cudaStream_t stream, bool cache) {
 
         CudaCheckErrorModNoSync;
         // cudaDeviceSynchronize();
+        if (pool_poison_on())
+            pool_poison(ptr, id, bytes, stream);
         if (stream != nullptr) {
             s[id].wait(stream);
+        } else if (pool_null_edge_on()) {
+            // a record on the legacy stream follows all earlier work on every blocking stream, so the block's readers
+            // there come before its reuse (graph captures never get here: GPUfree serves them from graph memory above)
+            s[id].wait(cudaStreamLegacy);
         }
         CudaCheckErrorModNoSync;
-        free_limb.emplace_back(ptr);
+        void* entry = ptr;
+        if (poolRaceStatsOn()) {
+            poolRaceCount(stream != nullptr ? PoolRace::StreamFree : PoolRace::NullFree);
+            if (stream == nullptr)
+                entry = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(ptr) | kNullFreedTag);
+        }
+        free_limb.emplace_back(entry);
         if (PoolSlab* sl = slab_of(id, ptr))
             sl->nfree++;
         if (pool_trace_on())

@@ -234,6 +234,26 @@ std::vector<std::array<size_t, 4>> GPUpoolBySize(int id);
  * first. */
 std::vector<std::pair<std::string, size_t>> GPUpoolTrace(int id, int depth);
 
+/* Pool ordering diagnostics, all off by default:
+ *   FIDESLIB_POOL_NULL_EDGE=1   a pooled free with a null (legacy) stream orders the block's reuse after the legacy
+ *                               stream, i.e. after all earlier work on every blocking stream (otherwise it has no edge)
+ *   FIDESLIB_POOL_POISON=1      every pooled free overwrites the block's first min(bytes, 4096) bytes with 0xFF at the
+ *                               point from which the pool hands it out again, so an unordered late reader sees garbage
+ *   FIDESLIB_POOL_RACE_STATS=1  the counters below, one [pool_race] line at exit */
+enum class PoolRace : int {
+    NullFree,          // pooled frees with a null stream
+    StreamFree,        // pooled frees with a non-null stream
+    NullToStreamPop,   // pops by a non-null stream of a block whose last free had a null stream
+    AuxCapDestroy,     // recycled polynomials destroyed past FIDESLIB_AUX_POLY_MAX
+    LtDotUnchunked,    // LinearTransform dots on the default (non-chunked) path
+    MultPtAdjust,      // Ciphertext::multPt / addPt / subPt plaintext adjust temporaries
+    AddPtAdjust,
+    SubPtAdjust,
+    Count
+};
+bool poolRaceStatsOn();
+void poolRaceCount(PoolRace c);   // no-op unless FIDESLIB_POOL_RACE_STATS is set
+
 
 
 // ---- Capture hooks (FIDESlib's own translation units only, FIDESLIB_CAPTURE_HOOKS): outside a capture they are the

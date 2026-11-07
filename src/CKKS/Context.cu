@@ -1350,8 +1350,10 @@ void ContextData::returnAuxilarPoly(RNSPoly&& c) {
         graphAuxPool().emplace_back(std::move(c));
         return;
     }
-    if (precom.auxPoly.size() >= cap)
+    if (precom.auxPoly.size() >= cap) {
+        FIDESlib::poolRaceCount(FIDESlib::PoolRace::AuxCapDestroy);
         return;   // not taken: the caller (Ciphertext::~Ciphertext) destroys it with its members
+    }
     precom.auxPoly.emplace_back(std::move(c));
 }
 

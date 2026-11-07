@@ -4,6 +4,8 @@
 #include "CKKS/BootstrapPrecomputation.cuh"
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <variant>
 #include <vector>
@@ -44,6 +46,22 @@ struct BatchPtrTable {
     BatchPtrTable(const BatchPtrTable&) = delete;
     BatchPtrTable& operator=(const BatchPtrTable&) = delete;
 };
+
+/* FIDESLIB_LT_JOIN=1 (ordering diagnostic): LTdotProductPtBatch waits on every operand's stream before its kernels and
+ * makes every operand's stream wait on it afterwards, not only out[0] / pt[0] (it reads all of in[], e.g. a linear
+ * transform's rotated ciphertexts, on in[0]'s stream). Off: the [0]-only joins. */
+bool ltJoinAll() {
+    static const bool v = [] {
+        const char* e = std::getenv("FIDESLIB_LT_JOIN");
+        const bool on = e && std::atoi(e) > 0;
+        if (on) {
+            std::printf("[pool_race] FIDESLIB_LT_JOIN: LT dot joins every operand stream\n");
+            std::fflush(stdout);
+        }
+        return on;
+    }();
+    return v;
+}
 }  // namespace
 
 void LimbPartition::addBatchManyToOne(std::vector<LimbPartition*>& parta, const std::vector<LimbPartition*>& partb,
@@ -532,6 +550,15 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out, const 
     void*** const data_ptrs_d = tbl.d;
     s.wait(out[0]->s);
     s.wait(pt[0]->s);
+    if (ltJoinAll()) {
+        for (LimbPartition* p : out)
+            s.wait(p->s);
+        for (LimbPartition* p : in)
+            s.wait(p->s);
+        for (LimbPartition* p : pt)
+            if (p)
+                s.wait(p->s);
+    }
 
     if constexpr (!VER2) {
         if (do_regular && limbsize > 0) {
@@ -589,6 +616,15 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out, const 
     }
     out[0]->s.wait(s);
     pt[0]->s.wait(s);
+    if (ltJoinAll()) {
+        for (LimbPartition* p : out)
+            p->s.wait(s);
+        for (LimbPartition* p : in)
+            p->s.wait(s);
+        for (LimbPartition* p : pt)
+            if (p)
+                p->s.wait(s);
+    }
 }
 
 void LimbPartition::fusedHoistedRotateBatch(std::vector<LimbPartition*>& out, const std::vector<LimbPartition*>& in,

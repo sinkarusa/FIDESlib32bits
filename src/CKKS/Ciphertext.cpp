@@ -251,6 +251,7 @@ void Ciphertext::addPt(const Plaintext& b) {
 
 		if (b.c0.getLevel() != this->getLevel() || b.NoiseLevel != this->NoiseLevel) {
 			Plaintext b_(cc_);
+			FIDESlib::poolRaceCount(FIDESlib::PoolRace::AddPtAdjust);
 			if (!b_.adjustPlaintextToCiphertext(b, *this)) {
 				// In release builds, avoid silent no-op when adjustment fails.
 				if (b.c0.getLevel() < this->getLevel()) {
@@ -283,6 +284,7 @@ void Ciphertext::subPt(const Plaintext& b) {
 
 		if (b.c0.getLevel() != this->getLevel() || b.NoiseLevel != this->NoiseLevel) {
 			Plaintext b_(cc_);
+			FIDESlib::poolRaceCount(FIDESlib::PoolRace::SubPtAdjust);
 			if (!b_.adjustPlaintextToCiphertext(b, *this)) {
 				if (b.c0.getLevel() < this->getLevel()) {
 					this->dropToLevel(b.c0.getLevel());
@@ -482,6 +484,7 @@ void Ciphertext::multPt(const Plaintext& b, bool rescale) {
 	if (cc.rescaleTechnique == FIXEDAUTO || cc.rescaleTechnique == FLEXIBLEAUTO || cc.rescaleTechnique == FLEXIBLEAUTOEXT) {
 		if (b.c0.getLevel() != this->getLevel() || b.NoiseLevel == 2 /*!hasSameScalingFactor(b)*/) {
 			Plaintext b_(cc_);
+			FIDESlib::poolRaceCount(FIDESlib::PoolRace::MultPtAdjust);
 			if constexpr (PRINT)
 				std::cout << "multPt: adjust input plaintext" << std::endl;
 
